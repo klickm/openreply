@@ -47,6 +47,8 @@ const LOOKBACK_HOURS = Number(process.env.COMMENT_POLL_LOOKBACK_HOURS ?? 72);
 const MAX_NEW_PER_SWEEP = Number(process.env.COMMENT_POLL_MAX_PER_SWEEP ?? 30);
 // For "any post" campaigns, how many recent posts to scan.
 const RECENT_MEDIA_LIMIT = 10;
+// Same ceiling the worker applies (the queue's `attempts`).
+const MAX_SEND_ATTEMPTS = 3;
 
 interface SweepStat {
   campaign: string;
@@ -234,13 +236,21 @@ async function sweepCampaign({
     // reply, the completion signal is publicReplySentAt (a DM alone is not
     // enough — the reply still has to land); otherwise a SENT DM is enough. This
     // is what lets a comment whose DM sent but whose public reply failed come
-    // back and retry the reply.
+    // back and retry the reply. A DM that already failed its full set of
+    // attempts counts as done too: re-enqueueing it every sweep is how a
+    // failing comment turned into dozens of sends to the same person.
     const handled = await prisma.dmLog.findMany({
       where: {
         automationId: automation.id,
         commentId: { in: needsAction.map((c) => c.id) },
         AND: [
-          { OR: [{ status: "SENT" }, { dmDeliveryUnconfirmed: true }] },
+          {
+            OR: [
+              { status: "SENT" },
+              { dmDeliveryUnconfirmed: true },
+              { status: "FAILED", attempts: { gte: MAX_SEND_ATTEMPTS } },
+            ],
+          },
           ...(automation.publicReplyEnabled ? [{ OR: [{ publicReplySentAt: { not: null } }, { publicReplyDeliveryUnconfirmed: true }] }] : []),
         ],
       },

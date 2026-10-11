@@ -13,6 +13,7 @@ const {
   mockMatchKeywords,
   mockReserveDMSlot,
   mockReleaseDMSlot,
+  mockReserveRecipientSend,
   mockQueueAdd,
   mockReserveWorkspaceDMSend,
   mockReleaseWorkspaceDMReservation,
@@ -49,6 +50,7 @@ const {
   mockMatchKeywords: vi.fn(),
   mockReserveDMSlot: vi.fn(),
   mockReleaseDMSlot: vi.fn(),
+  mockReserveRecipientSend: vi.fn(),
   mockQueueAdd: vi.fn(),
   mockReserveWorkspaceDMSend: vi.fn(),
   mockReleaseWorkspaceDMReservation: vi.fn(),
@@ -99,6 +101,7 @@ vi.mock("@/lib/utils/keyword-matcher", () => ({
 vi.mock("@/lib/utils/rate-limiter", () => ({
   reserveDMSlot: mockReserveDMSlot,
   releaseDMSlot: mockReleaseDMSlot,
+  reserveRecipientSend: mockReserveRecipientSend,
 }));
 
 vi.mock("@/lib/billing/usage", () => ({
@@ -137,6 +140,7 @@ vi.mock("bullmq", () => {
 });
 
 import { createDMWorker } from "../lib/queue/dm-worker";
+import { MetaApiError } from "@/lib/meta/client";
 
 const usagePeriodStart = new Date("2026-05-01T00:00:00.000Z");
 
@@ -258,6 +262,7 @@ beforeEach(() => {
     reserved: true,
   });
   mockReleaseDMSlot.mockResolvedValue(0);
+  mockReserveRecipientSend.mockResolvedValue(true);
   mockReleaseWorkspaceDMReservation.mockResolvedValue({ count: 1 });
   mockSendPrivateReply.mockResolvedValue({
     recipient_id: "commenter_999",
@@ -1399,5 +1404,178 @@ describe("durable Zernio postback delivery", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+});
+
+// Meta answers some sends with code=1 ("An unknown error has occurred") even
+// though the message reached the user. Treating that as a failure and retrying
+// it delivered the same DM dozens of times to one person.
+describe("DM Worker — Meta sends with an unconfirmed outcome", () => {
+  const unknownError = () =>
+    new MetaApiError(1, undefined, "trace", "An unknown error has occurred.");
+
+  it("does not retry a private reply that Meta answered with code=1", async () => {
+    mockSendPrivateReply.mockRejectedValue(unknownError());
+
+    await expect(getProcessor()(createMockJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+    });
+    expect(mockSendPrivateReply).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          status: "FAILED",
+          dmDeliveryUnconfirmed: true,
+        }),
+      })
+    );
+  });
+
+  it("does not send a plain-text copy after a code=1 on the button template", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...mockAutomation,
+        trackedLinks: [
+          { slug: "abc123", label: null, destinationUrl: "https://example.com" },
+        ],
+      },
+    ]);
+    mockSendPrivateReplyWithLinkButton.mockRejectedValue(unknownError());
+
+    await expect(getProcessor()(createMockJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+    });
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+  });
+
+  it("does not retry an opening DM that Meta answered with code=1", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...mockAutomation,
+        openingDmEnabled: true,
+        openingDmMessage: "Tap below",
+        openingDmButtonLabel: "Send it",
+      },
+    ]);
+    mockSendPrivateReplyWithButton.mockRejectedValue(unknownError());
+
+    await expect(getProcessor()(createMockJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+    });
+  });
+
+  it("does not repost a public reply that Meta answered with code=1", async () => {
+    const { sendCommentReply } = await import("@/lib/meta/client");
+    vi.mocked(sendCommentReply).mockRejectedValueOnce(unknownError());
+    mockPrisma.automation.findMany.mockResolvedValue([
+      {
+        ...mockAutomation,
+        publicReplyEnabled: true,
+        publicReplyMessage: "Check your DMs",
+        publicReplyMessages: [],
+      },
+    ]);
+
+    await getProcessor()(createMockJob());
+
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ publicReplyDeliveryUnconfirmed: true }),
+      })
+    );
+  });
+
+  it("does not retry a button-tap reveal that Meta answered with code=1", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(mockAutomation);
+    mockSendDirectMessage.mockRejectedValue(unknownError());
+
+    await expect(getProcessor()(createMockPostbackJob())).rejects.toMatchObject({
+      name: "UnrecoverableError",
+    });
+    expect(mockPrisma.dmLog.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({
+        update: expect.objectContaining({ dmDeliveryUnconfirmed: true }),
+      })
+    );
+  });
+
+  it("does not retry a DM-trigger reply that Meta answered with code=1", async () => {
+    mockPrisma.automation.findMany.mockResolvedValue([
+      { ...mockAutomation, dmTriggerEnabled: true, requireFollow: false },
+    ]);
+    mockSendDirectMessage.mockRejectedValue(unknownError());
+
+    await expect(
+      getProcessor()({
+        name: "process-message",
+        data: {
+          instagramAccountId: "ig_456",
+          messageId: "mid_abc",
+          messageText: "LINK",
+          senderId: "commenter_999",
+        },
+        id: "message_job_001",
+        attemptsMade: 0,
+      })
+    ).rejects.toMatchObject({ name: "UnrecoverableError" });
+  });
+
+  it("still retries a send Meta clearly refused", async () => {
+    mockSendPrivateReply.mockRejectedValue(
+      new MetaApiError(10, undefined, "trace", "Permission denied")
+    );
+
+    await expect(getProcessor()(createMockJob())).rejects.toMatchObject({
+      name: "MetaApiError",
+    });
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ dmDeliveryUnconfirmed: false }),
+      })
+    );
+  });
+});
+
+describe("DM Worker — bounded resends", () => {
+  it("stops sending a comment's DM once it has failed three times", async () => {
+    // A polling sweep re-enqueues any comment without a SENT DM. Without this
+    // stop, a comment whose DM keeps failing is retried every five minutes.
+    mockPrisma.dmLog.findUnique.mockResolvedValue({
+      status: "FAILED",
+      attempts: 3,
+      dmDeliveryUnconfirmed: false,
+      publicReplySentAt: null,
+    });
+
+    await getProcessor()(createMockJob());
+
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+  });
+
+  it("does not message someone who already hit the per-person cap", async () => {
+    mockReserveRecipientSend.mockResolvedValue(false);
+
+    await getProcessor()(createMockJob());
+
+    expect(mockReserveRecipientSend).toHaveBeenCalledWith(
+      "ig_456",
+      "commenter_999"
+    );
+    expect(mockSendPrivateReply).not.toHaveBeenCalled();
+    expect(mockReleaseWorkspaceDMReservation).toHaveBeenCalled();
+    expect(mockPrisma.dmLog.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ status: "SKIPPED_RATE_LIMIT" }),
+      })
+    );
+  });
+
+  it("does not send a button-tap reveal past the per-person cap", async () => {
+    mockPrisma.automation.findFirst.mockResolvedValue(mockAutomation);
+    mockReserveRecipientSend.mockResolvedValue(false);
+
+    await getProcessor()(createMockPostbackJob());
+
+    expect(mockSendDirectMessage).not.toHaveBeenCalled();
   });
 });

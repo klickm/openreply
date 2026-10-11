@@ -216,6 +216,50 @@ export async function releaseDMSlot(
   return next;
 }
 
+// Per-person ceiling on messages from one account. A normal flow sends a person
+// three or four messages (opening DM, follow prompt, link, follow-up); anything
+// past this is a loop, and repeated DMs to one person are what Instagram flags
+// as spam. Slots are never handed back: a failed send may still have arrived.
+const RECIPIENT_MAX_PER_HOUR = 6;
+const RECIPIENT_MAX_PER_DAY = 12;
+
+const RESERVE_RECIPIENT_SCRIPT = `
+local hour = tonumber(redis.call("GET", KEYS[1]) or "0")
+local day = tonumber(redis.call("GET", KEYS[2]) or "0")
+if hour >= tonumber(ARGV[1]) or day >= tonumber(ARGV[2]) then
+  return 0
+end
+if redis.call("INCR", KEYS[1]) == 1 then
+  redis.call("EXPIRE", KEYS[1], 3600)
+end
+if redis.call("INCR", KEYS[2]) == 1 then
+  redis.call("EXPIRE", KEYS[2], 86400)
+end
+return 1
+`;
+
+/**
+ * Reserve one message to a person, or refuse it when the account already sent
+ * them RECIPIENT_MAX_PER_HOUR in the last hour or RECIPIENT_MAX_PER_DAY in the
+ * last day. A circuit breaker for retry loops, independent of why they happen.
+ */
+export async function reserveRecipientSend(
+  instagramAccountId: string,
+  recipientId: string
+): Promise<boolean> {
+  const client = getRedis();
+  const base = `rate:recipient:${instagramAccountId}:${recipientId}`;
+  const result = await client.eval(
+    RESERVE_RECIPIENT_SCRIPT,
+    2,
+    `${base}:hour`,
+    `${base}:day`,
+    RECIPIENT_MAX_PER_HOUR,
+    RECIPIENT_MAX_PER_DAY
+  );
+  return toScriptNumber(result) === 1;
+}
+
 /**
  * Backwards-compatible helper for tests and admin scripts.
  * Prefer reserveDMSlot in workers.
@@ -251,4 +295,11 @@ export async function resetRateLimit(
 }
 
 // Export constants for use in tests
-export { RATE_LIMIT_MAX, RATE_LIMIT_WINDOW, REQUEUE_DELAY_MS, MAX_REQUEUE_ATTEMPTS };
+export {
+  RATE_LIMIT_MAX,
+  RATE_LIMIT_WINDOW,
+  REQUEUE_DELAY_MS,
+  MAX_REQUEUE_ATTEMPTS,
+  RECIPIENT_MAX_PER_HOUR,
+  RECIPIENT_MAX_PER_DAY,
+};

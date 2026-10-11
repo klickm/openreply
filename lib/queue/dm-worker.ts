@@ -32,7 +32,11 @@ import {
   type InstagramContext,
 } from "@/lib/instagram/provider";
 import { matchKeywords } from "@/lib/utils/keyword-matcher";
-import { reserveDMSlot, releaseDMSlot } from "@/lib/utils/rate-limiter";
+import {
+  reserveDMSlot,
+  releaseDMSlot,
+  reserveRecipientSend,
+} from "@/lib/utils/rate-limiter";
 import {
   releaseWorkspaceDMReservation,
   reserveWorkspaceDMSend,
@@ -51,6 +55,29 @@ import {
 } from "@/lib/zernio/client";
 
 const BACKOFF_DELAYS = [5 * 60 * 1000, 15 * 60 * 1000, 45 * 60 * 1000];
+
+const RECIPIENT_CAP_MESSAGE = "Per-person message cap reached; not sent";
+
+// Matches the queue's `attempts`. A comment whose DM has failed this many times
+// is not tried again, however often the polling sweep re-enqueues it.
+const MAX_SEND_ATTEMPTS = 3;
+
+/**
+ * True when a send failed without telling us whether the message arrived.
+ *
+ * Meta answers some sends with code 1 ("An unknown error has occurred") or
+ * code 2 (temporary service issue) after delivering them, and a 5xx or a dropped
+ * connection says nothing either way. Retrying any of these can deliver the same
+ * message again, and repeated DMs to one person get the account flagged for
+ * spam, so they are recorded as unconfirmed and never retried.
+ */
+function isDeliveryUnconfirmed(error: unknown): boolean {
+  if (error instanceof ZernioDeliveryUnconfirmedError) return true;
+  if (error instanceof MetaApiError) {
+    return error.code === 1 || error.code === 2 || error.code >= 500;
+  }
+  return error instanceof TypeError && error.message === "fetch failed";
+}
 
 function formatError(error: unknown): string {
   if (error instanceof MetaApiError) {
@@ -75,6 +102,7 @@ const NON_TEMPLATE_REJECTIONS = [
 
 function isTemplateRejection(error: unknown): boolean {
   if (
+    isDeliveryUnconfirmed(error) ||
     error instanceof TokenExpiredError ||
     error instanceof RateLimitError ||
     error instanceof ZernioApiError
@@ -286,7 +314,11 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
 
     const alreadyDmd = existingLog?.status === "SENT";
     const alreadyPublicReplied = Boolean(existingLog?.publicReplySentAt);
-    const needsDm = !alreadyDmd && !existingLog?.dmDeliveryUnconfirmed;
+    const sendsExhausted =
+      existingLog?.status === "FAILED" &&
+      existingLog.attempts >= MAX_SEND_ATTEMPTS;
+    const needsDm =
+      !alreadyDmd && !existingLog?.dmDeliveryUnconfirmed && !sendsExhausted;
 
     // Skip only when there is genuinely nothing left to do. A comment whose DM
     // already sent but whose public reply never posted (e.g. it hit a rate
@@ -440,7 +472,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
                 commentId,
               },
             },
-            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError },
+            data: { publicReplyError: formatError(error), publicReplyDeliveryUnconfirmed: isDeliveryUnconfirmed(error) },
           })
           .catch(() => {});
       }
@@ -516,7 +548,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
       });
       throw error;
@@ -573,6 +605,27 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
         );
         continue;
       }
+    }
+
+    if (!(await reserveRecipientSend(instagramAccountId, commenterId))) {
+      if (rateLimit?.reserved) {
+        await releaseDMSlot(instagramAccountId);
+      }
+      await releaseWorkspaceDMReservation(
+        automation.workspaceId,
+        usage.periodStart
+      );
+      await prisma.dmLog.update({
+        where: {
+          automationId_commentId: { automationId: automation.id, commentId },
+        },
+        data: {
+          status: "SKIPPED_RATE_LIMIT",
+          matchedKeyword: matchResult.matchedKeyword,
+          errorMessage: RECIPIENT_CAP_MESSAGE,
+        },
+      });
+      continue;
     }
 
     // With an opening DM, the private reply is a button message; tapping it
@@ -737,7 +790,7 @@ async function processComment(job: Job<ProcessCommentJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
       });
       throw error;
@@ -886,6 +939,10 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     });
     if (follows === false) {
       if (fallback) return;
+      if (!(await reserveRecipientSend(instagramAccountId, userId))) {
+        console.log(`[DM Worker] ${RECIPIENT_CAP_MESSAGE}: follow prompt`);
+        return;
+      }
       const promptText = renderMessageWithoutLink({
         message:
           automation.followPromptMessage ||
@@ -914,6 +971,11 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
       }
       return;
     }
+  }
+
+  if (!(await reserveRecipientSend(instagramAccountId, userId))) {
+    console.log(`[DM Worker] ${RECIPIENT_CAP_MESSAGE}: reveal`);
+    return;
   }
 
   const usage = await reserveWorkspaceDMSend(automation.workspaceId);
@@ -1015,7 +1077,7 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
     // failure the user can act on — so don't log it as FAILED and don't retry
     // it against a window that cannot reopen on its own. It still delivers in
     // the case that does work: the user replied by typing instead of tapping.
-    if (fallback && !(error instanceof ZernioDeliveryUnconfirmedError)) {
+    if (fallback && !isDeliveryUnconfirmed(error)) {
       console.log(
         "[DM Worker] Read fallback not delivered (messaging window closed):",
         formatError(error),
@@ -1040,12 +1102,12 @@ async function processPostback(job: Job<ProcessPostbackJob>): Promise<void> {
         commentId: dedupeId,
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
       },
       update: {
         status: "FAILED",
         errorMessage: formatError(error),
-        dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+        dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
       },
     });
     throw error;
@@ -1082,6 +1144,11 @@ async function processFollowUp(job: Job<ProcessFollowUpJob>): Promise<void> {
       `${job.id}:${automation.id}`
     );
   } catch {
+    return;
+  }
+
+  if (!(await reserveRecipientSend(instagramAccountId, userId))) {
+    console.log(`[DM Worker] ${RECIPIENT_CAP_MESSAGE}: follow-up`);
     return;
   }
 
@@ -1249,6 +1316,27 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           : follows !== true;
     }
 
+    if (!(await reserveRecipientSend(instagramAccountId, senderId))) {
+      await prisma.dmLog.upsert({
+        where: {
+          automationId_commentId: {
+            automationId: automation.id,
+            commentId: dedupeId,
+          },
+        },
+        create: {
+          ...logBase,
+          status: "SKIPPED_RATE_LIMIT",
+          errorMessage: RECIPIENT_CAP_MESSAGE,
+        },
+        update: {
+          status: "SKIPPED_RATE_LIMIT",
+          errorMessage: RECIPIENT_CAP_MESSAGE,
+        },
+      });
+      continue;
+    }
+
     const usage = await reserveWorkspaceDMSend(automation.workspaceId);
     if (!usage.allowed) {
       await prisma.dmLog.upsert({
@@ -1354,13 +1442,13 @@ async function processMessage(job: Job<ProcessMessageJob>): Promise<void> {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
         update: {
           status: "FAILED",
           attempts: job.attemptsMade + 1,
           errorMessage: formatError(error),
-          dmDeliveryUnconfirmed: error instanceof ZernioDeliveryUnconfirmedError,
+          dmDeliveryUnconfirmed: isDeliveryUnconfirmed(error),
         },
       });
       throw error;
@@ -1385,8 +1473,8 @@ async function processJob(job: Job<DmQueueJob>): Promise<void> {
   try {
     await dispatchJob(job);
   } catch (error) {
-    if (error instanceof ZernioDeliveryUnconfirmedError)
-      throw new UnrecoverableError(error.message);
+    if (isDeliveryUnconfirmed(error))
+      throw new UnrecoverableError(formatError(error));
     throw error;
   }
 }

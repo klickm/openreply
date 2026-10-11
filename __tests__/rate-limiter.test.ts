@@ -34,7 +34,10 @@ import {
   incrementDMCounter,
   reserveDMSlot,
   releaseDMSlot,
+  reserveRecipientSend,
   RATE_LIMIT_MAX,
+  RECIPIENT_MAX_PER_HOUR,
+  RECIPIENT_MAX_PER_DAY,
 } from "../lib/utils/rate-limiter";
 
 beforeEach(() => {
@@ -155,5 +158,31 @@ describe("releaseDMSlot", () => {
 
     expect(count).toBe(0);
     expect(mockDel).toHaveBeenCalledWith("rate:dm:account_123");
+  });
+});
+
+describe("reserveRecipientSend", () => {
+  it("counts per account and person, hourly and daily", async () => {
+    mockEval.mockResolvedValue(1);
+
+    await expect(reserveRecipientSend("account_123", "user_9")).resolves.toBe(
+      true
+    );
+    expect(mockEval).toHaveBeenCalledWith(
+      expect.any(String),
+      2,
+      "rate:recipient:account_123:user_9:hour",
+      "rate:recipient:account_123:user_9:day",
+      RECIPIENT_MAX_PER_HOUR,
+      RECIPIENT_MAX_PER_DAY
+    );
+  });
+
+  it("refuses once the person reached the cap", async () => {
+    mockEval.mockResolvedValue(0);
+
+    await expect(reserveRecipientSend("account_123", "user_9")).resolves.toBe(
+      false
+    );
   });
 });
