@@ -186,3 +186,9 @@ describe("reserveRecipientSend", () => {
     );
   });
 });
+
+describe("hourly cap", () => {
+  it("defaults to 60 private replies an hour", () => {
+    expect(RATE_LIMIT_MAX).toBe(60);
+  });
+});

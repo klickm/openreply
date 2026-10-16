@@ -13,7 +13,7 @@ const { mockPrisma } = vi.hoisted(() => ({
 
 vi.mock("@/lib/db/client", () => ({ prisma: mockPrisma }));
 
-import { adMediaFor } from "../lib/polling/comment-reconciler";
+import { adMediaFor, sweepStartMs } from "../lib/polling/comment-reconciler";
 
 const POST = "18023946917554990";
 const AD = "17899788633163100";
@@ -46,5 +46,19 @@ describe("adMediaFor", () => {
   it("swallows a query failure, leaving the post itself still swept", async () => {
     mockPrisma.$queryRaw.mockRejectedValue(new Error("connection lost"));
     await expect(adMediaFor(POST)).resolves.toEqual([]);
+  });
+});
+
+describe("sweepStartMs", () => {
+  const lookbackStart = Date.parse("2026-10-13T00:00:00Z");
+
+  it("ignores comments left before the account was reconnected", () => {
+    const reconnected = new Date("2026-10-16T01:00:00Z");
+    expect(sweepStartMs(lookbackStart, reconnected)).toBe(reconnected.getTime());
+  });
+
+  it("keeps the normal lookback when the account was connected earlier", () => {
+    const connected = new Date("2026-09-25T00:00:00Z");
+    expect(sweepStartMs(lookbackStart, connected)).toBe(lookbackStart);
   });
 });

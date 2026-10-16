@@ -89,6 +89,7 @@ export async function reconcileComments(): Promise<void> {
           provider: true,
           workspaceId: true,
           zernioAccountId: true,
+          updatedAt: true,
         },
       },
     },
@@ -138,6 +139,7 @@ async function sweepCampaign({
       provider: "META" | "ZERNIO";
       workspaceId: string;
       zernioAccountId: string | null;
+      updatedAt: Date;
     };
   };
   sinceMs: number;
@@ -197,7 +199,7 @@ async function sweepCampaign({
       comments = await getRecentMediaComments({
         context: accessToken,
         mediaId: mediaId,
-        sinceMs: sinceMs,
+        sinceMs: sweepStartMs(sinceMs, account.updatedAt),
       });
     } catch (error) {
       stat.errors.push(`Comments ${mediaId}: ${errMessage(error)}`);
@@ -293,6 +295,19 @@ async function sweepCampaign({
   }
 
   return stat;
+}
+
+/**
+ * Earliest comment time a sweep may act on for an account.
+ *
+ * The account row changes when it is (re)connected. Comments older than that
+ * were left while the account was disconnected — after a password change, say —
+ * and nobody expects a DM for them hours later; a burst of such catch-up DMs
+ * right after a reconnect is also exactly the pattern that gets an account
+ * restricted. Those are resent deliberately, if at all, not by the sweep.
+ */
+export function sweepStartMs(sinceMs: number, accountUpdatedAt: Date): number {
+  return Math.max(sinceMs, accountUpdatedAt.getTime());
 }
 
 /**

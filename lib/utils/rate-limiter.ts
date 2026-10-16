@@ -9,14 +9,18 @@
  * requeues rather than pushing through.
  * https://developers.facebook.com/docs/graph-api/overview/rate-limiting/
  *
- * Note this is a hard ceiling with no headroom. If Meta throttles before the
- * documented limit, or other calls on the same account share the bucket, lower
- * this value.
+ * That documented cap is far above what Instagram tolerates before it restricts
+ * an account for automated messaging: an account sending ~170 DMs an hour was
+ * restricted. The default is therefore 60 an hour, overridable per deployment
+ * with DM_RATE_LIMIT_PER_HOUR (never above Meta's 750).
  */
 
 import Redis from "ioredis";
 
-const RATE_LIMIT_MAX = 750; // private replies per hour, per Meta's documented cap
+const RATE_LIMIT_MAX = Math.min(
+  Number(process.env.DM_RATE_LIMIT_PER_HOUR) || 60,
+  750
+); // private replies per hour, per account
 const RATE_LIMIT_WINDOW = 3600; // 1 hour in seconds
 const REQUEUE_DELAY_MS = 30 * 60 * 1000; // 30 minutes
 const MAX_REQUEUE_ATTEMPTS = 3;
