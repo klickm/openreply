@@ -301,3 +301,35 @@ describe("matchKeywords — diacritics", () => {
     expect(matchKeywords("иод", ["йод"], true).matched).toBe(false);
   });
 });
+
+describe("matchKeywords — emoji-only keywords", () => {
+  it("matches a lone emoji reply (story reply with 🔥)", () => {
+    expect(matchKeywords("🔥", ["🔥"], true)).toEqual({
+      matched: true,
+      matchedKeyword: "🔥",
+    });
+  });
+
+  it("matches repeated emoji and emoji inside text", () => {
+    expect(matchKeywords("🔥🔥🔥", ["🔥"], true).matched).toBe(true);
+    expect(matchKeywords("quero 🔥", ["🔥"], true).matched).toBe(true);
+    expect(matchKeywords("quero🔥", ["🔥"], false).matched).toBe(true);
+  });
+
+  it("ignores variation selectors and skin tones", () => {
+    expect(matchKeywords("❤️", ["❤"], true).matched).toBe(true);
+    expect(matchKeywords("❤", ["❤️"], true).matched).toBe(true);
+    expect(matchKeywords("👍🏽", ["👍"], true).matched).toBe(true);
+  });
+
+  it("does not match a different emoji or plain text", () => {
+    expect(matchKeywords("😍", ["🔥"], true).matched).toBe(false);
+    expect(matchKeywords("fogo", ["🔥"], true).matched).toBe(false);
+  });
+
+  it("still matches word keywords alongside an emoji keyword", () => {
+    expect(matchKeywords("LINK", ["🔥", "link"], true).matchedKeyword).toBe(
+      "link"
+    );
+  });
+});

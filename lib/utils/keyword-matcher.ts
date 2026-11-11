@@ -156,6 +156,17 @@ export function foldDiacritics(text: string): string {
 }
 
 /**
+ * Canonicalise text for emoji/symbol-only keywords: drop whitespace,
+ * variation selectors (U+FE0E/U+FE0F) and skin-tone modifiers, which phones
+ * add or omit inconsistently ("❤" vs "❤️", "👍" vs "👍🏽").
+ */
+function normalizeSymbols(text: string): string {
+  return text
+    .normalize("NFC")
+    .replace(/[\s\u{FE0E}\u{FE0F}\u{1F3FB}-\u{1F3FF}]/gu, "");
+}
+
+/**
  * Check if a comment text matches any of the given keywords.
  *
  * Both sides are stripped of special characters and folded for Latin
@@ -181,16 +192,25 @@ export function matchKeywords(
     stripSpecialCharacters(normalizeArabicScript(commentText))
   ).toLowerCase();
 
-  if (!cleanedText) {
-    return { matched: false, matchedKeyword: null };
-  }
+  const symbolText = normalizeSymbols(commentText);
 
   for (const keyword of keywords) {
     const cleanedKeyword = foldDiacritics(
       stripSpecialCharacters(normalizeArabicScript(keyword))
     ).toLowerCase();
 
-    if (!cleanedKeyword) continue;
+    if (!cleanedKeyword) {
+      // A keyword made only of emoji/symbols ("🔥") is erased by
+      // stripSpecialCharacters, so it used to be skipped and could never
+      // match. Compare those keywords against the raw text instead.
+      const symbolKeyword = normalizeSymbols(keyword);
+      if (symbolKeyword && symbolText.includes(symbolKeyword)) {
+        return { matched: true, matchedKeyword: keyword };
+      }
+      continue;
+    }
+
+    if (!cleanedText) continue;
 
     // Only numeric-like keywords get the O/0 fold — a word keyword compares
     // exactly as before.
